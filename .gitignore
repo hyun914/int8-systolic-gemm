@@ -1,0 +1,12 @@
+# Simulation outputs
+*.vcd
+*.vvp
+sim_*
+chk
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
