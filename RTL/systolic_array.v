@@ -24,8 +24,6 @@ b_v: b-vertical INT8
 a_out을 a_in에 직접 꽃을 수 없다.
 */
 
-
-
     wire [7:0] a_h  [0:ROWS-1][0:COLS]; //PE끼리 연결하는 wire
     wire       av_h [0:ROWS-1][0:COLS]; 
     wire [7:0] b_v  [0:ROWS][0:COLS-1];

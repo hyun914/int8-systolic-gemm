@@ -6,15 +6,15 @@ INT8 Output-Stationary Systolic Array 기반 GEMM 코어를 RTL로 설계하고,
 
 ---
 
-## 현재 상태 (2026-10-29)
+## 현재 상태 (2026-10-30)
 
 | 항목 | 상태 |
 |---|---|
 | 개념 학습 (GEMM, layout/stride, systolic/skew, dataflow, banking, tiling, roofline, ready/valid) | 완료 |
 | Python 기능 정답 모델 `model/gemm_reference.py` | 완료: 2×2 예제 통과 |
 | 단일 PE `RTL/PE.v` + self-checking TB `tb/tb_PE.v` | 완료: 14개 케이스 PASS |
-| S1: 파라미터화 배열 `RTL/systolic_array.v` | 작성 완료: 4×4, 2×3 구성 컴파일 통과 |
-| S1: 2×2 배열 TB `tb/tb_array_2x2.v` | 작성 중 |
+| S1: 파라미터화 배열 `RTL/systolic_array.v` | 완료: 2×2 동작 검증, 4×4와 2×3 컴파일 통과 |
+| S1: 2×2 배열 TB `tb/tb_array_2x2.v` | 완료: 13개 step PASS |
 | S1b ~ S6 | 예정 |
 | Python 성능 모델 (사이클 예측) | 미구현 |
 
@@ -28,7 +28,7 @@ INT8 Output-Stationary Systolic Array 기반 GEMM 코어를 RTL로 설계하고,
 │   └── systolic_array.v     # ROWS×COLS 배열
 ├── tb/                      # 검증
 │   ├── tb_PE.v              # PE self-checking TB
-│   └── tb_array_2x2.v       # (S1 작성 중) 2×2 배열 TB
+│   └── tb_array_2x2.v       # 2×2 배열 TB
 └── model/                   # Python 모델
     └── gemm_reference.py    # 기능 정답 모델 (계산 결과만, 사이클 예측 없음)
 ```
@@ -53,7 +53,7 @@ vvp sim_pe
 iverilog -g2005 -o chk RTL/systolic_array.v RTL/PE.v
 iverilog -g2005 -Psystolic_array.ROWS=2 -Psystolic_array.COLS=3 -o chk RTL/systolic_array.v RTL/PE.v
 
-# (S1 이후) 2×2 배열 테스트
+# 2×2 배열 테스트
 iverilog -g2005 -o sim_array tb/tb_array_2x2.v RTL/systolic_array.v RTL/PE.v
 vvp sim_array
 ```
@@ -320,12 +320,12 @@ R, C / A, B bank 수와 폭 / 경계 공급 능력 (B/cycle) / 외부 W / 외부
 
 산출물: `RTL/systolic_array.v`, `tb/tb_array_2x2.v`
 
-- [ ] t0~t3 매 사이클 acc 4개가 2.4절 표와 일치
-- [ ] 입력 종료 후 acc 유지
-- [ ] clear 1사이클 후 acc 전부 0, 다른 행렬(-128/127 포함)로 재실행 시 이전 값이 섞이지 않음
-- [ ] valid=0 슬롯의 쓰레기 값이 결과에 영향 없음
+- [x] t0~t3 매 사이클 acc 4개가 2.4절 표와 일치
+- [x] 입력 종료 후 acc 유지
+- [x] clear 1사이클 후 acc 전부 0, 다른 행렬(-128/127 포함)로 재실행 시 이전 값이 섞이지 않음
+- [x] valid=0 슬롯의 쓰레기 값이 결과에 영향 없음
 - [x] 2×3 구성 elaboration 통과
-- [ ] `tb_PE` 회귀 PASS
+- [x] `tb_PE` 회귀 PASS
 
 ### S1b: 배열 단독 랜덤 검증
 
