@@ -1,4 +1,5 @@
 # Simulation outputs
+build/
 *.vcd
 *.vvp
 sim_*

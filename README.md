@@ -15,7 +15,8 @@ INT8 Output-Stationary Systolic Array 기반 GEMM 코어를 RTL로 설계하고,
 | 단일 PE `RTL/PE.v` + self-checking TB `tb/tb_PE.v` | 완료: 14개 케이스 PASS |
 | S1: 파라미터화 배열 `RTL/systolic_array.v` | 완료: 2×2 동작 검증, 4×4와 2×3 컴파일 통과 |
 | S1: 2×2 배열 TB `tb/tb_array_2x2.v` | 완료: 13개 step PASS |
-| S1b ~ S6 | 예정 |
+| S1b: 배열 랜덤 검증 `tb/tb_array.v` | 완료: 60개 구성 PASS |
+| S2 ~ S6 | 예정 |
 | Python 성능 모델 (사이클 예측) | 미구현 |
 
 ## 디렉터리 구조
@@ -28,12 +29,16 @@ INT8 Output-Stationary Systolic Array 기반 GEMM 코어를 RTL로 설계하고,
 │   └── systolic_array.v     # ROWS×COLS 배열
 ├── tb/                      # 검증
 │   ├── tb_PE.v              # PE self-checking TB
-│   └── tb_array_2x2.v       # 2×2 배열 TB
-└── model/                   # Python 모델
-    └── gemm_reference.py    # 기능 정답 모델 (계산 결과만, 사이클 예측 없음)
+│   ├── tb_array_2x2.v       # 2×2 배열 TB (손 계산 표와 비교)
+│   └── tb_array.v           # ROWS×COLS 배열 랜덤 TB
+├── model/                   # Python 모델
+│   ├── gemm_reference.py    # 기능 정답 모델 (계산 결과만, 사이클 예측 없음)
+│   └── gen_vectors.py       # 테스트 벡터 생성 (A, B, 정답 C를 hex로 저장)
+└── scripts/
+    └── run_array_tests.py   # S1b 전체 구성 실행
 ```
 
-시뮬레이션 산출물(`sim_*`, `*.vcd`)은 저장소에 포함하지 않는다.
+시뮬레이션 산출물(`sim_*`, `*.vcd`)과 생성된 벡터(`build/`)는 저장소에 포함하지 않는다.
 
 ## 실행 방법
 
@@ -56,6 +61,9 @@ iverilog -g2005 -Psystolic_array.ROWS=2 -Psystolic_array.COLS=3 -o chk RTL/systo
 # 2×2 배열 테스트
 iverilog -g2005 -o sim_array tb/tb_array_2x2.v RTL/systolic_array.v RTL/PE.v
 vvp sim_array
+
+# 배열 랜덤 검증: 배열 크기 5가지 × K 4가지 × seed 3개 = 60회
+python scripts/run_array_tests.py
 ```
 
 `-g2005`: 배열 내부에서 다차원 wire 배열을 사용하므로 지정한다.
@@ -329,10 +337,21 @@ R, C / A, B bank 수와 폭 / 경계 공급 능력 (B/cycle) / 외부 W / 외부
 
 ### S1b: 배열 단독 랜덤 검증
 
-산출물: Python 벡터 생성기 (A/B/C hex 출력), 파라미터화 `tb_array.v`
+산출물: `model/gen_vectors.py` (A/B/C hex 생성), `tb/tb_array.v` (파라미터화 TB), `scripts/run_array_tests.py` (전체 구성 실행)
 
-- [ ] 2×2, 2×3, 3×2, 4×4, 8×8 단일 타일 (M=R, N=C), K ∈ {1, 2, 29, 64}, 고정 seed 여러 개
-- [ ] t = K+R+C-3 posedge 직후 전체 일치, 직전 사이클에 PE(R-1,C-1)은 마지막 곱 하나가 빠진 값
+- [x] 2×2, 2×3, 3×2, 4×4, 8×8 단일 타일 (M=R, N=C), K ∈ {1, 2, 29, 64}, seed 1~3: 60/60 PASS
+- [x] 매 사이클 모든 PE의 acc가 TB가 계산한 부분합과 일치. 따라서 t = K+R+C-3 posedge 직후 전체가 완료되고, 그 직전 사이클에는 PE(R-1,C-1)에 마지막 곱 하나가 빠져 있음을 확인한다.
+- [x] 입력이 끝난 뒤 2사이클 동안 acc 유지, 모든 PE의 최종 acc가 Python 정답 C와 일치
+- [x] valid=0 칸에 무작위 값을 넣어도 결과에 영향 없음
+
+**검증 환경 확인 (버그 주입)**: RTL에 버그를 일부러 넣고 같은 60개 구성을 실행해, TB가 각 버그를 잡는지 확인했다.
+
+| 주입한 버그 | 결과 | 잡힌 위치 |
+|---|---|---|
+| PE가 valid를 무시하고 항상 MAC | 0/60 | t=1 PE(0,0), 무효 칸의 무작위 값이 누산됨 |
+| acc 출력 인덱스를 `r*ROWS+c`로 씀 | 44/60 | 2×3은 시뮬레이션에서, 3×2는 컴파일에서 실패. 정방 배열은 통과 |
+| A 경계 연결 루프를 `r<COLS`로 씀 | 48/60 | 3×2만 실패, 행 2가 연결되지 않아 acc=0 |
+| PE가 한 사이클 늦게 MAC (전달 레지스터 값을 곱함) | 0/60 | t=0 PE(0,0). 최종값 비교만 하면 60/60 통과하므로 매 사이클 비교가 필요하다 |
 
 ### S2: 4×4 기준 코어
 
