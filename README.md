@@ -16,7 +16,8 @@ INT8 Output-Stationary Systolic Array 기반 GEMM 코어를 RTL로 설계하고,
 | S1: 파라미터화 배열 `RTL/systolic_array.v` | 완료: 2×2 동작 검증, 4×4와 2×3 컴파일 통과 |
 | S1: 2×2 배열 TB `tb/tb_array_2x2.v` | 완료: 13개 step PASS |
 | S1b: 배열 랜덤 검증 `tb/tb_array.v` | 완료: 60개 구성 PASS |
-| S2 ~ S6 | 예정 |
+| S2: GEMM 코어 `RTL/gemm_core.v` | 완료: 4×4, 2×3, 8×8에서 세 워크로드 연속 실행 PASS |
+| S3 ~ S6 | 예정 |
 | Python 성능 모델 (사이클 예측) | 미구현 |
 
 ## 디렉터리 구조
@@ -26,16 +27,22 @@ INT8 Output-Stationary Systolic Array 기반 GEMM 코어를 RTL로 설계하고,
 ├── README.md
 ├── RTL/                     # 설계
 │   ├── PE.v                 # Output Stationary PE
-│   └── systolic_array.v     # ROWS×COLS 배열
+│   ├── systolic_array.v     # ROWS×COLS 배열
+│   ├── bank_buffer.v        # 입력 버퍼 (bank마다 독립 읽기 주소)
+│   ├── edge_feeder.v        # skew 읽기 주소와 경계 valid 생성
+│   ├── load_seq.v           # 타일 로드 순서 생성
+│   └── gemm_core.v          # GEMM 코어 (FSM, 타일 제어, 결과 저장)
 ├── tb/                      # 검증
 │   ├── tb_PE.v              # PE self-checking TB
 │   ├── tb_array_2x2.v       # 2×2 배열 TB (손 계산 표와 비교)
-│   └── tb_array.v           # ROWS×COLS 배열 랜덤 TB
+│   ├── tb_array.v           # ROWS×COLS 배열 랜덤 TB
+│   └── tb_gemm_core.v       # 코어 시스템 TB (메모리 모델, 연속 명령)
 ├── model/                   # Python 모델
 │   ├── gemm_reference.py    # 기능 정답 모델 (계산 결과만, 사이클 예측 없음)
 │   └── gen_vectors.py       # 테스트 벡터 생성 (A, B, 정답 C를 hex로 저장)
 └── scripts/
-    └── run_array_tests.py   # S1b 전체 구성 실행
+    ├── run_array_tests.py   # S1b 전체 구성 실행
+    └── run_core_tests.py    # S2 코어 검증 실행
 ```
 
 시뮬레이션 산출물(`sim_*`, `*.vcd`)과 생성된 벡터(`build/`)는 저장소에 포함하지 않는다.
@@ -64,6 +71,9 @@ vvp sim_array
 
 # 배열 랜덤 검증: 배열 크기 5가지 × K 4가지 × seed 3개 = 60회
 python scripts/run_array_tests.py
+
+# 코어 검증: 배열 3가지 × seed 2개, 시뮬레이션마다 세 워크로드 연속 실행 (약 40초)
+python scripts/run_core_tests.py
 ```
 
 `-g2005`: 배열 내부에서 다차원 wire 배열을 사용하므로 지정한다.
@@ -77,7 +87,7 @@ python scripts/run_array_tests.py
 - **데이터 형식**: 입력 A/B는 signed INT8, 누산과 출력은 signed INT32
 - **Dataflow**: Output Stationary 하나. A는 가로(왼쪽→오른쪽), B는 세로(위→아래)로 이동하고 각 PE가 C[i,j]를 누산기에 유지한다.
 - **K 처리**: K 전체를 버퍼에 담는다 (K ≤ `K_MAX`). K 방향 분할은 하지 않는다.
-- **실행 순서**: 타일마다 Load → Clear → Compute → Store를 순차 실행한다. 단계 간 중첩(double buffering)은 없다.
+- **실행 순서**: 타일마다 SETUP(누산기 clear) → LOAD → COMPUTE → STORE를 순차 실행한다. 단계 간 중첩(double buffering)은 없다.
 - **완료 조건**: 경계 타일도 배열 전체 크기 기준으로 고정 대기한다 (3.1절).
 - **Padding**: 배열에 주입하지 않는다. 유효 범위 밖의 행, 열은 valid=0으로 두고, 외부 메모리에서도 유효 원소만 읽는다. 따라서 하드웨어가 센 MAC 수는 정확히 M×N×K여야 한다.
 - **배열 크기**: `ROWS`/`COLS` 파라미터로 지정한다. 입력, 누산 비트폭은 고정이다.
@@ -214,6 +224,37 @@ t의 posedge 직후 acc
   - acc: t0 `[16384, 0; 0, 0]` → t1 `[32513, 128; 384, 0]` → t2 `[32513, -126; 1019, 3]` → t3 `[32513, -126; 1019, -7]`
   - (-128)(-1) = 128은 unsigned 곱셈이면 32640이 되므로 signed 곱셈을 검증한다. 127×(-2), 5×(-2)는 음수 곱이라 부호 확장을 검증한다.
 
+### 2.5 GEMM 코어 (`RTL/gemm_core.v`, S2)
+
+```
+명령 (M, N, K, base_a, base_b, base_c)
+FSM: IDLE -> SETUP -> LOAD -> COMPUTE -> STORE -> 다음 타일이면 SETUP, 마지막이면 DONE
+
+SETUP    배열 clear, load_seq 두 개를 타일 첫 원소로 초기화
+LOAD     load_seq(요청) --> 메모리 읽기 요청
+         메모리 읽기 응답 --> load_seq(응답)이 정한 bank, 칸에 저장
+                              A bank × ROWS, B bank × COLS (bank_buffer)
+COMPUTE  edge_feeder × 2 --> bank마다 주소 k = t - i로 동시에 읽기 --> systolic_array
+STORE    acc_out에서 유효 원소만 골라 --> 메모리 쓰기 (C)
+```
+
+**메모리 배치** (바이트 주소, row-major, 행 사이 빈칸 없음)
+
+- A[i][k] = base_a + i×K + k (INT8)
+- B[k][j] = base_b + k×N + j (INT8)
+- C[i][j] = base_c + (i×N + j)×4 (INT32, little-endian)
+
+**메모리 인터페이스**: 읽기 요청(`rd_req_valid/ready/addr`), 읽기 응답(`rd_rsp_valid/data`), 쓰기(`wr_valid/ready/addr/data`). 응답은 요청 순서대로 돌아온다고 가정하고, 코어는 응답을 항상 받는다. S2에서는 읽기 1바이트/beat, 쓰기 INT32 1개/beat이다.
+
+**설계 선택**
+
+- **bank 구성**: A는 행마다, B는 열마다 bank를 하나씩 둔다. bank 안 주소는 k이다. skew 때문에 행마다 같은 사이클에 읽어야 하는 k가 다르므로, bank를 나눠 bank마다 다른 주소로 동시에 읽는다. bank는 각각 읽기 1개, 쓰기 1개 포트를 가진다.
+- **skew 생성**: 레인 i는 COMPUTE 사이클 t에 k = t - i를 읽는다. 지연 레지스터를 쌓지 않고 카운터 하나와 빼기로 skew를 만든다.
+- **padding**: 레인 i ≥ 유효 행(열) 수이면 valid=0으로 둬서 배열에 넣지 않는다. 메모리에서도 유효 원소만 읽는다.
+- **로드 순서 두 개**: 요청 쪽과 응답 쪽에 같은 순서 생성기(`load_seq`)를 하나씩 둔다. 응답이 요청 순서대로 오면 응답 쪽 생성기가 돌아온 바이트의 bank와 칸을 알려 주므로, 메모리 지연이 몇 사이클이든 그대로 동작한다.
+- **타일 순서**: i(행 타일) 바깥, j(열 타일) 안쪽이다. 타일마다 A와 B를 새로 읽는다 (재사용 정책 P0).
+- **S2 메모리 모델**: TB의 메모리는 항상 ready이고 읽기 응답은 요청 다음 사이클에 온다. 폭 W, 지연 L, stall은 S3에서 추가한다.
+
 ---
 
 ## 3. 성능 모델 정의
@@ -226,15 +267,27 @@ t의 posedge 직후 acc
 COMPUTE 상태 길이 = K + R + C - 2 + L_feed
 ```
 
-`L_feed`는 버퍼 읽기, feeder 파이프라인 지연이다. S2에서 RTL 구조가 정해지면 값을 확정하고 Python 모델에 같은 값을 사용한다. 유효 행, 열까지만 기다리는 조기 종료(K + r_valid + c_valid - 2)는 S5의 비교 옵션이다.
+`L_feed`는 bank 읽기 지연이다. S2 RTL의 bank는 동기식 읽기(주소를 넣은 다음 사이클에 데이터)이므로 `L_feed = 1`이고, COMPUTE는 K+R+C-1 사이클이다. 유효 행, 열까지만 기다리는 조기 종료(K + r_valid + c_valid - 2)는 S5의 비교 옵션이다.
 
 ### 3.2 사이클 모델
 
 항목 하나가 RTL 카운터 하나에 대응한다.
 
 ```
-T_total = T_cmd + Σ_tiles [ T_load(tile) + T_clear + T_compute + T_store(tile) ] + T_done
+T_total = Σ_tiles [ T_setup + T_load(tile) + T_compute + T_store(tile) ] + T_done
 ```
+
+T_total은 start를 받은 다음 사이클(SETUP)부터 DONE까지 코어가 busy인 사이클 수이다. S2 RTL(이상적 메모리)의 상태별 사이클은 다음과 같다. rv, cv는 타일의 유효 행, 열 수이다.
+
+| 상태 | 사이클 | 내용 |
+|---|---|---|
+| SETUP | 1 | 누산기 clear, 로드 순서 초기화 |
+| LOAD | rv×K + K×cv + 2 | 읽기 요청 1개/사이클, 응답 지연 1, 마지막 응답 확인 1 |
+| COMPUTE | K + R + C - 1 | 고정 대기 (L_feed = 1) |
+| STORE | rv×cv | 결과 1개/사이클 |
+| DONE | 1 | 명령마다 한 번 |
+
+이 식은 S2의 RTL 측정값 9개(배열 3가지 × 워크로드 3가지)와 모두 일치한다. S3에서 메모리 폭 W, 지연 L, stall이 들어가면 LOAD와 STORE의 식이 바뀐다.
 
 - 순차 구조이므로 `max(Load, Compute, Store)`를 쓰지 않는다.
 - 항목별로 예측해서 불일치가 생긴 단계를 바로 찾는다.
@@ -355,13 +408,34 @@ R, C / A, B bank 수와 폭 / 경계 공급 능력 (B/cycle) / 외부 W / 외부
 
 ### S2: 4×4 기준 코어
 
-산출물: A 버퍼 (R bank), B 버퍼 (C bank), skew feeder, 타일 FSM, 결과 버퍼
+산출물: `RTL/gemm_core.v`, `RTL/load_seq.v`, `RTL/bank_buffer.v`, `RTL/edge_feeder.v`, `tb/tb_gemm_core.v`, `scripts/run_core_tests.py`
 
-- [ ] 4×4에서 세 워크로드 결과 전체 일치
-- [ ] shape이 다른 연속 두 명령의 결과가 독립
-- [ ] (7,13,29) 경계 타일에서 padding 위치 PE의 acc = 0
+시뮬레이션 한 번에 세 워크로드를 연속 명령으로 실행하고, 끝난 뒤 메모리 전체(64KB)를 기대값과 비교한다. 배열 4×4, 2×3, 8×8, seed 2개(seed 2는 명령 순서를 뒤집음)로 6회 실행한다.
 
-이 단계의 TB는 단순 포트로 버퍼를 직접 채운다. 외부 프로토콜은 S3에서 추가한다.
+- [x] 4×4에서 세 워크로드 결과 전체 일치 (2×3, 8×8도 일치)
+- [x] shape이 다른 명령을 연속으로 실행해도 결과가 독립 (순서를 뒤집어도 일치)
+- [x] (7,13,29), (1,64,64) 경계 타일에서 padding 위치 PE의 acc = 0
+- [x] STORE 동안 유효한 PE의 acc가 이미 최종값 (COMPUTE가 끝난 뒤 STORE 시작)
+- [x] C의 모든 바이트가 정확히 한 번 쓰이고, C 밖의 메모리는 바뀌지 않음
+
+**RTL 측정 사이클** (S2 이상적 메모리: 읽기 1바이트/사이클, 응답 지연 1, 쓰기 INT32 1개/사이클)
+
+| (M,N,K) | 4×4 | 2×3 | 8×8 |
+|---|---|---|---|
+| (32,64,64) | 77,057 | 137,633 | 37,441 |
+| (1,64,64) | 6,369 | 7,131 | 5,329 |
+| (7,13,29) | 1,970 | 3,335 | 969 |
+
+모두 3.2절의 상태별 식과 일치한다. 이 메모리 모델에서는 LOAD가 대부분을 차지한다. 예를 들어 4×4의 (32,64,64)는 타일 하나에 602사이클이 걸리는데, 그중 LOAD가 514사이클이다.
+
+**검증 환경 확인 (버그 주입)**: 4×4와 2×3에서 seed 1로 실행했다.
+
+| 주입한 버그 | 잡힌 검사 | 비고 |
+|---|---|---|
+| feeder가 유효 행/열 제한을 무시 (padding 주입) | padding 검사 | 최종 메모리는 정답과 같다. padding 위치 PE의 불필요한 MAC은 이 검사로만 보인다 |
+| COMPUTE를 한 사이클 일찍 끝냄 | STORE 중 최종값 검사 | 저장 순서상 마지막 PE를 가장 늦게 써서 최종 메모리는 정답과 같았다. 이 검사를 추가하기 전에는 통과했다 |
+| C의 행 간격을 N이 아니라 COLS로 계산 | 중복 쓰기 검사 | 같은 주소를 두 번 씀 |
+| B의 행 간격을 N이 아니라 K로 계산 | 메모리 비교 | 잘못된 B를 읽어 결과가 틀림 |
 
 ### S3: 외부 메모리 모델 + 계측 카운터
 

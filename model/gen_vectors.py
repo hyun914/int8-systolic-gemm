@@ -8,10 +8,12 @@ Verilog $readmemh로 읽을 수 있는 hex 파일로 저장한다.
   b.hex : B (K x COLS), row-major, 한 줄에 8비트 값 하나
   c.hex : C (ROWS x COLS), row-major, 한 줄에 32비트 값 하나
 
-음수는 2의 보수로 저장한다. 예: -128 -> 80, -1 -> ff
+음수는 2의 보수로 저장. 예: -128 -> 80, -1 -> ff
 
 사용 예 (저장소 최상위에서):
   python model/gen_vectors.py --rows 4 --cols 4 --k 29 --seed 1
+
+  
 """
 
 import argparse
@@ -41,12 +43,17 @@ def write_hex(path, header, matrix, bits):
                 f.write(to_hex(value, bits) + "\n")
 
 
+def make_matrices(m, n, k, seed):
+    """seed로 A (M x K), B (K x N)를 만들고 정답 C (M x N)를 계산해 돌려준다."""
+    rng = random.Random(seed)
+    A = random_matrix(m, k, rng)
+    B = random_matrix(k, n, rng)
+    return A, B, gemm_reference(A, B)
+
+
 def write_vectors(rows, cols, k, seed, out_dir):
     """A, B, C를 만들어 out_dir에 a.hex, b.hex, c.hex로 저장하고 돌려준다."""
-    rng = random.Random(seed)
-    A = random_matrix(rows, k, rng)
-    B = random_matrix(k, cols, rng)
-    C = gemm_reference(A, B)
+    A, B, C = make_matrices(rows, cols, k, seed)
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
