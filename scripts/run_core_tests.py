@@ -67,9 +67,10 @@ def build_images(workloads, seed):
         for i in range(m):
             for kk in range(k):
                 mem[base_a + i * k + kk] = A[i][kk] & 0xFF
-        for kk in range(k):
-            for j in range(n):
-                mem[base_b + kk * n + j] = B[kk][j] & 0xFF
+        # B는 전치(N x K)로 저장한다: 열 j의 K개 원소가 이어진다
+        for j in range(n):
+            for kk in range(k):
+                mem[base_b + j * k + kk] = B[kk][j] & 0xFF
 
         results.append((base_c, n, C))
         cmds.append((m, n, k, base_a, base_b, base_c))

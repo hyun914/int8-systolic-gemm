@@ -3,8 +3,9 @@
 // load_seq : LOAD 동안 "지금 차례인 원소"를 세는 카운터
 //
 // 출력 하나로 두 가지를 알려 준다: 메모리에서 어디를 읽을지(addr), bank의 어디에 넣을지(phase_b, lane, k).
-//   A 단계: r = 0 .. rows_valid-1, k = 0 .. K-1   (A[i0+r][k], 주소가 계속 +1)
-//   B 단계: k = 0 .. K-1, c = 0 .. cols_valid-1   (B[k][j0+c], 행 안에서 +1, 다음 행으로 +N)
+//   A 단계: r = 0 .. rows_valid-1, k = 0 .. K-1   (A[i0+r][k])
+//   B 단계: c = 0 .. cols_valid-1, k = 0 .. K-1   (B[k][j0+c], B는 전치(N x K)로 저장되어 있다)
+// A 타일의 행들과 B 타일의 열들은 메모리에서 K바이트씩 이어져 있으므로, 두 단계 모두 k가 안쪽 루프이고 주소가 1씩 증가한다.
 // step이 1인 사이클이 끝나면 다음 원소로 넘어가고, 마지막 원소를 지나면 finished가 1이 된다.
 //
 // 코어는 이 모듈을 두 개 쓴다. 요청 쪽은 요청이 받아들여질 때, 응답 쪽은 응답이 올 때 한 칸씩 진행한다.
@@ -20,9 +21,8 @@ module load_seq #(
     input  wire [15:0]   rows_valid,
     input  wire [15:0]   cols_valid,
     input  wire [15:0]   k_len,       // K
-    input  wire [15:0]   n_len,       // N (B의 한 행 길이)
     input  wire [AW-1:0] a_start,     // A[i0][0]의 주소
-    input  wire [AW-1:0] b_start,     // B[0][j0]의 주소
+    input  wire [AW-1:0] b_start,     // B[0][j0]의 주소 (전치 배치에서 j0열의 시작)
     output reg           phase_b,     // 0: A 단계, 1: B 단계
     output reg  [15:0]   lane,        // bank 번호 (A 단계 r, B 단계 c). 필요한 폭은 log2(max(ROWS, COLS))비트 (README 7.1절)
     output reg  [15:0]   k,           // bank 안 칸 번호 0 .. K-1. 필요한 폭은 log2(K_MAX)비트 (README 7.1절)
@@ -30,11 +30,8 @@ module load_seq #(
     output reg           finished
 );
 
-    reg [AW-1:0] row_base;            // B 단계: 현재 행 B[k][j0]의 주소
-
-    wire last_k   = (k == k_len - 1);
-    wire last_row = (lane == rows_valid - 1);
-    wire last_col = (lane == cols_valid - 1);
+    wire last_k    = (k == k_len - 1);
+    wire last_lane = phase_b ? (lane == cols_valid - 1) : (lane == rows_valid - 1);
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -42,45 +39,31 @@ module load_seq #(
             lane     <= 16'd0;
             k        <= 16'd0;
             addr     <= {AW{1'b0}};
-            row_base <= {AW{1'b0}};
             finished <= 1'b1;
         end else if (init) begin
             phase_b  <= 1'b0;
             lane     <= 16'd0;
             k        <= 16'd0;
             addr     <= a_start;
-            row_base <= b_start;
             finished <= 1'b0;
         end else if (step && !finished) begin
-            if (!phase_b) begin
-                // A 단계: k가 안쪽 루프. A 타일의 행들은 메모리에서 이어져 있어 주소가 1씩 증가한다.
-                if (!last_k) begin
-                    k    <= k + 1'b1;
-                    addr <= addr + 1'b1;
-                end else if (!last_row) begin
-                    k    <= 16'd0;
-                    lane <= lane + 1'b1;
-                    addr <= addr + 1'b1;
-                end else begin
-                    // A 타일 끝: B 단계로 넘어간다
-                    phase_b <= 1'b1;
-                    lane    <= 16'd0;
-                    k       <= 16'd0;
-                    addr    <= b_start;
-                end
+            if (!last_k) begin
+                // 같은 행(A) 또는 같은 열(B) 안: 다음 k
+                k    <= k + 1'b1;
+                addr <= addr + 1'b1;
+            end else if (!last_lane) begin
+                // 다음 행(A) 또는 다음 열(B): 메모리에서 바로 이어진다
+                k    <= 16'd0;
+                lane <= lane + 1'b1;
+                addr <= addr + 1'b1;
+            end else if (!phase_b) begin
+                // A 타일 끝: B 단계로 넘어간다
+                phase_b <= 1'b1;
+                lane    <= 16'd0;
+                k       <= 16'd0;
+                addr    <= b_start;
             end else begin
-                // B 단계: c가 안쪽 루프. 한 행을 다 읽으면 N만큼 떨어진 다음 행으로 간다.
-                if (!last_col) begin
-                    lane <= lane + 1'b1;
-                    addr <= addr + 1'b1;
-                end else if (!last_k) begin
-                    lane     <= 16'd0;
-                    k        <= k + 1'b1;
-                    row_base <= row_base + n_len;
-                    addr     <= row_base + n_len;
-                end else begin
-                    finished <= 1'b1;
-                end
+                finished <= 1'b1;
             end
         end
     end

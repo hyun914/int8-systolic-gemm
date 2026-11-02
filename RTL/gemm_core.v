@@ -6,9 +6,9 @@
 // 타일마다 SETUP -> LOAD -> COMPUTE -> STORE를 순서대로 실행하고, 단계끼리 겹치지 않는다.
 // 타일 순서: i(행 타일) 바깥, j(열 타일) 안쪽. 타일마다 A와 B를 새로 읽는다 (재사용 정책 P0).
 //
-// 메모리 배치 (바이트 주소, row-major, 행 사이 빈칸 없음)
-//   A[i][k] = base_a + i*K + k          INT8
-//   B[k][j] = base_b + k*N + j          INT8
+// 메모리 배치 (바이트 주소, 빈칸 없음)
+//   A[i][k] = base_a + i*K + k          INT8, row-major (M x K)
+//   B[k][j] = base_b + j*K + k          INT8, 전치 배치 (N x K): 열마다 k가 이어진다
 //   C[i][j] = base_c + (i*N + j)*4      INT32, little-endian
 //
 // 메모리 인터페이스 (S2: 읽기는 1바이트/beat, 쓰기는 INT32 1개/beat)
@@ -78,7 +78,7 @@ module gemm_core #(
 
     // 타일 시작 주소 (타일마다 한 번만 쓴다)
     wire [AW-1:0] a_start = base_a_r + i0 * k_r;            // A[i0][0]의 주소 (타일 첫 행의 시작)
-    wire [AW-1:0] b_start = base_b_r + j0;                  // B[0][j0]의 주소 (타일 첫 열의 맨 위)
+    wire [AW-1:0] b_start = base_b_r + j0 * k_r;            // B[0][j0]의 주소 (전치 배치에서 타일 첫 열의 시작)
     wire [AW-1:0] c_start = base_c_r + (i0 * n_r + j0) * 4; // C[i0][j0]의 주소 (INT32라서 *4)
 
     // LOAD: 요청 순서와 응답 순서
@@ -97,7 +97,6 @@ module gemm_core #(
         .rows_valid(rows_valid), 
         .cols_valid(cols_valid),
         .k_len(k_r), 
-        .n_len(n_r),
         .a_start(a_start), 
         .b_start(b_start),
         .phase_b(), 
@@ -125,7 +124,6 @@ module gemm_core #(
         .rows_valid(rows_valid), 
         .cols_valid(cols_valid),
         .k_len(k_r), 
-        .n_len(n_r),
         .a_start(a_start), 
         .b_start(b_start),
         .phase_b(rsp_phase_b), 
