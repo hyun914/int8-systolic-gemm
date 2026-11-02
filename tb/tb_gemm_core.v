@@ -13,16 +13,17 @@
 //   - STORE 동안 유효한 PE의 acc는 이미 최종 정답이다 (COMPUTE가 끝난 뒤에 STORE를 시작했다)
 //   - STORE 동안 유효 범위 밖 PE의 acc는 0이다 (padding을 배열에 넣지 않았다)
 //
-// 메모리 모델 (S2): 항상 ready, 읽기 응답은 요청 다음 사이클에 돌아온다.
+// 메모리 모델: 항상 ready, 읽기 응답은 요청이 성립하고 RD_LAT사이클 뒤에 돌아온다 (기본 1).
 module tb_gemm_core;
 
-    parameter ROWS = 4;
-    parameter COLS = 4;
+    parameter     ROWS = 4;
+    parameter     COLS = 4;
+    parameter     RD_LAT = 1;   // 메모리 읽기 지연 L (사이클, 1 이상)
 
-    localparam K_MAX     = 64;
-    localparam AW        = 16;
-    localparam MEM_BYTES = 1 << AW;
-    localparam MAX_CMDS  = 8;
+    localparam    K_MAX     = 64;
+    localparam    AW        = 16;
+    localparam    MEM_BYTES = 1 << AW;
+    localparam    MAX_CMDS  = 8;
 
     reg           clk;
     reg           rst_n;
@@ -35,8 +36,8 @@ module tb_gemm_core;
 
     wire          rd_req_valid;
     wire [AW-1:0] rd_req_addr;
-    reg           rd_rsp_valid;
-    reg  [7:0]    rd_rsp_data;
+    wire          rd_rsp_valid;
+    wire [7:0]    rd_rsp_data;
 
     wire          wr_valid;
     wire [AW-1:0] wr_addr;
@@ -72,15 +73,29 @@ module tb_gemm_core;
     initial clk = 1'b0;
     always #5 clk = ~clk;
 
-    // 메모리 읽기: ready가 항상 1이므로 valid인 사이클마다 요청이 성립하고, 다음 사이클에 응답한다.
+    // 메모리 읽기: ready가 항상 1이므로 valid인 사이클마다 요청이 성립하고, RD_LAT사이클 뒤에 응답한다.
+    // valid와 data를 RD_LAT칸짜리 shift register로 나란히 민다 (칸 하나 = FF 하나 = 1사이클).
+    // RD_LAT = 1이면 요청 다음 사이클에 응답한다 (S2 기본값).
+    reg        rsp_v_pipe [0:RD_LAT-1];
+    reg [7:0]  rsp_d_pipe [0:RD_LAT-1];
+    integer    li;
+
     always @(posedge clk) begin
         if (!rst_n) begin
-            rd_rsp_valid <= 1'b0;
+            for (li = 0; li < RD_LAT; li = li + 1)
+                rsp_v_pipe[li] <= 1'b0;
         end else begin
-            rd_rsp_valid <= rd_req_valid;
-            rd_rsp_data  <= mem[rd_req_addr];
+            rsp_v_pipe[0] <= rd_req_valid;              // 1칸째: 요청이 성립한 사이클의 값을 담는다
+            rsp_d_pipe[0] <= mem[rd_req_addr];
+            for (li = 1; li < RD_LAT; li = li + 1) begin
+                rsp_v_pipe[li] <= rsp_v_pipe[li-1];     // 한 사이클에 한 칸씩 이동
+                rsp_d_pipe[li] <= rsp_d_pipe[li-1];
+            end
         end
     end
+
+    assign rd_rsp_valid = rsp_v_pipe[RD_LAT-1];         // 마지막 칸이 코어로 나간다
+    assign rd_rsp_data  = rsp_d_pipe[RD_LAT-1];
 
     // 메모리 쓰기: C 원소 하나(4바이트)를 little-endian으로 저장한다.
     always @(posedge clk) begin
