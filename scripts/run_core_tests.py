@@ -138,8 +138,8 @@ def main():
         parser.error("--stall은 0 이상 99 이하여야 한다")
     if args.lat < 1:
         parser.error("--lat은 1 이상이어야 한다")
-    if args.width < 1:
-        parser.error("--width는 1 이상이어야 한다")
+    if args.width < 1 or args.width & (args.width - 1) or K_MAX % args.width:
+        parser.error(f"--width는 2의 거듭제곱이고 K_MAX={K_MAX}를 나눠야 한다 (bank word 폭)")
 
     BUILD.mkdir(exist_ok=True)
     failures = []

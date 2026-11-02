@@ -15,6 +15,7 @@ INT8 Output-Stationary systolic array 기반 GEMM 코어를 RTL로 설계하고 
 | GEMM 코어: bank 입력 버퍼, skew 공급, 타일 제어, 결과 저장 | `RTL/gemm_core.v`, `bank_buffer.v`, `edge_feeder.v`, `load_seq.v` | `tb/tb_gemm_core.v`: 4×4, 2×3, 8×8에서 명령 3개 연속 실행 |
 | 기능 정답 모델, 테스트 벡터 생성 | `model/gemm_reference.py`, `model/gen_vectors.py` | |
 | 사이클 모델 (3.2절 식) | `model/perf_model.py` | 코어 검증에서 명령마다 측정값과 자동 비교 |
+| Sky130 합성과 배치 (OpenROAD-flow-scripts) | `scripts/run_synth.py`, `syn/` | 면적, 배치 후 타이밍 (8절) |
 
 사이클 측정과 분석의 기본 조건은 TB의 이상적 메모리 모델(읽기 1바이트/beat, 응답 지연 1사이클)이다. 메모리 지연을 바꾼 측정은 7.2절, 메모리 폭을 바꾼 측정은 7.5절에 있다.
 
@@ -26,7 +27,7 @@ INT8 Output-Stationary systolic array 기반 GEMM 코어를 RTL로 설계하고 
 ├── RTL/                     # 설계
 │   ├── PE.v                 # Output Stationary PE
 │   ├── systolic_array.v     # ROWS×COLS 배열
-│   ├── bank_buffer.v        # 입력 버퍼 (bank마다 독립 읽기 주소)
+│   ├── bank_buffer.v        # 입력 버퍼 (bank마다 독립 읽기 주소, W바이트 word)
 │   ├── edge_feeder.v        # skew 읽기 주소와 경계 valid 생성
 │   ├── load_seq.v           # 타일 로드 순서 생성
 │   └── gemm_core.v          # GEMM 코어 (FSM, 타일 제어, 결과 저장)
@@ -39,9 +40,13 @@ INT8 Output-Stationary systolic array 기반 GEMM 코어를 RTL로 설계하고 
 │   ├── gemm_reference.py    # 기능 정답 모델 (계산 결과만, 사이클 예측 없음)
 │   ├── gen_vectors.py       # 테스트 벡터 생성 (A, B, 정답 C를 hex로 저장)
 │   └── perf_model.py        # 사이클 모델 (상태별 사이클 식)
+├── syn/                     # 합성, 배치 설정 (OpenROAD-flow-scripts)
+│   ├── config.mk            # 설계 설정 (파일 목록, 최상위 파라미터, 이용률)
+│   └── constraint.sdc       # 타이밍 제약 (클럭 10 ns)
 └── scripts/
     ├── run_array_tests.py   # 배열 랜덤 검증 실행 (60개 구성)
-    └── run_core_tests.py    # 코어 검증 실행
+    ├── run_core_tests.py    # 코어 검증 실행
+    └── run_synth.py         # 합성과 배치 실행, 면적과 타이밍 정리
 ```
 
 시뮬레이션 산출물(`sim_*`, `*.vcd`)과 생성된 벡터(`build/`)는 저장소에 포함하지 않는다.
@@ -79,7 +84,13 @@ python scripts/run_core_tests.py --lat 3 --width 8 --stall 25
 
 # 사이클 모델 예측값 출력
 python model/perf_model.py
+
+# Sky130 합성과 배치 (Docker 필요, 구성 4개에 약 30분)
+python scripts/run_synth.py
+python scripts/run_synth.py --config 4 4 16    # ROWS COLS RD_BYTES 하나만
 ```
+
+합성과 배치는 Docker 이미지 `openroad/orfs`를 쓴다 (`docker pull openroad/orfs:latest`). 환경은 8.1절에 있다.
 
 `-g2005`: 배열 내부에서 다차원 wire 배열을 사용하므로 지정한다.
 
@@ -246,7 +257,7 @@ A와 B 모두 K 방향으로 이어지게 저장한다. 그래서 타일의 A �
 
 **설계 선택**
 
-- **bank 구성**: A는 행마다, B는 열마다 bank를 하나씩 둔다. bank 안 주소는 k이고, bank depth는 K_MAX이다. skew 때문에 행마다 같은 사이클에 읽어야 하는 k가 다르므로, bank를 나눠 bank마다 다른 주소로 동시에 읽는다. bank는 각각 읽기 1개, 쓰기 1개 포트를 가진다.
+- **bank 구성**: A는 행마다, B는 열마다 bank를 하나씩 둔다. bank 안 주소는 k이고, bank depth는 K_MAX이다. skew 때문에 행마다 같은 사이클에 읽어야 하는 k가 다르므로, bank를 나눠 bank마다 다른 주소로 동시에 읽는다. bank는 각각 읽기 1개, 쓰기 1개 포트를 가진다. bank 하나는 W바이트 word K_MAX/W개로 이루어지고, 메모리 beat 하나를 word 하나에 쓴다 (7.7절).
 - **skew 생성**: 레인 i는 COMPUTE 사이클 t에 k = t - i를 읽는다. 지연 레지스터를 쌓지 않고 카운터 하나와 빼기로 skew를 만든다. 다른 구현 방식과의 비교는 7.3절에 있다.
 - **padding**: 레인 i ≥ 유효 행(열) 수이면 valid=0으로 둬서 배열에 넣지 않는다. 메모리에서도 유효 원소만 읽는다.
 - **로드 순서 두 개**: 요청 쪽과 응답 쪽에 같은 순서 생성기(`load_seq`)를 하나씩 둔다. 응답이 요청 순서대로 오면 응답 쪽 생성기가 돌아온 바이트의 bank와 칸을 알려 주므로, 메모리 지연이 몇 사이클이든 그대로 동작한다.
@@ -615,7 +626,7 @@ skew(행 r을 r사이클 늦게 배열에 넣는 것)를 만드는 방법은 두
 - A를 전치하는 방법도 있지만, M = 1처럼 행이 적은 워크로드에서 beat 하나에 쓸모 있는 바이트가 rv개뿐이라 W의 효과가 사라진다.
 - 진행: 전치 배치를 W = 1에서 먼저 적용해 사이클 9개가 이전과 같고 회귀가 모두 PASS인 것을 확인한 뒤 (요청 수가 같으므로), W바이트 beat를 넣었다.
 
-**구현**: 코어 파라미터 `RD_BYTES`(W). `load_seq`가 k를 W씩 진행하고 행(열)의 마지막 beat에서 쓸모 있는 바이트 수 `cnt = min(W, K - k)`를 내보낸다. `bank_buffer`는 한 사이클에 bank 하나의 연속 칸 W개까지 쓰고, 코어가 `cnt`로 만든 `wr_mask`가 실제로 쓸 칸을 고른다. 쓰기(STORE)는 그대로 INT32 1개/cycle이다.
+**구현**: 코어 파라미터 `RD_BYTES`(W). `load_seq`가 k를 W씩 진행하고 행(열)의 마지막 beat에서 쓸모 있는 바이트 수 `cnt = min(W, K - k)`를 내보낸다. `bank_buffer`는 한 사이클에 bank 하나의 word 하나(연속 칸 W개)를 쓰고, 코어가 `cnt`로 만든 `wr_mask`가 실제로 쓸 바이트를 고른다 (word 구성은 7.7절). 쓰기(STORE)는 그대로 INT32 1개/cycle이다.
 
 **측정** (L = 1, `python scripts/run_core_tests.py --width W`). W = 1, 2, 4, 8, 16과 L = 3에서 W = 4, 16, 모두 PASS이고, 측정값 63개(메모리 조건 7가지 × 배열 3가지 × 워크로드 3가지)가 3.2절 식과 모두 일치한다.
 
@@ -682,3 +693,86 @@ skew(행 r을 r사이클 늦게 배열에 넣는 것)를 만드는 방법은 두
 | STORE가 valid만 보고 다음 원소로 진행 | PASS (못 잡음) | FAIL: 첫 stall에서 쓰기 주소가 바뀜 |
 
 ready가 항상 1인 TB로는 두 버그 모두 드러나지 않는다. ready를 무시하는 버그는 stall을 넣어야만 검증할 수 있다.
+
+### 7.7 bank를 W바이트 word로: 합성 결과로 고친 구조
+
+**발견** (합성 결과): 처음 W바이트 beat를 넣었을 때 bank는 1바이트 칸 K_MAX개였고, 쓰기는 "칸 `wr_addr + j`에 바이트 j"였다. 4×4에서 W를 1에서 16으로 늘리자 FF 면적은 그대로인데 조합 면적이 154,748에서 331,796 um²로 늘었고 (ORFS 합성), 배치 면적은 1.60배가 됐다. 8×8 W = 16에서는 최악 경로가 쓰기 경로(`rd_rsp_valid` → 쓰기 enable → `bank_mem`)였다.
+
+**원인 확인**: 같은 Yosys 스크립트로 계층 유지와 `-flatten`만 바꿔 4×4를 합성했다.
+
+| 4×4 합성 면적 (um²) | 계층 유지 | 계층 펼침 |
+|---|---|---|
+| W = 1 | 295,012 | 284,358 |
+| W = 16 | 856,250 | 328,241 |
+
+계층을 유지하면 `bank_buffer`는 `wr_addr`에 아무 값이나 온다고 보고, 칸마다 16개 바이트 위치 중 하나를 고르는 쓰기 선택 회로를 만든다. 계층을 펼치면 도구가 `load_seq`의 k가 0, W, 2W, ...로만 움직인다는 것을 알아낸다. 펼친 W = 16 넷리스트에서 `u_rsp_seq.k`의 하위 4비트가 사라진 것으로 확인했다. 그러면 바이트 j는 항상 "칸 번호 mod 16 = j"인 칸으로만 가서 선택 회로가 1:1 연결로 줄어든다.
+
+**수정**: 도구의 최적화에 기대지 않고 구조로 만든다. bank 하나를 W바이트 word K_MAX/W개로 만들고, beat 하나를 word 하나에 쓴다 (`wr_word = k / W`, `wr_mask`는 word 안 바이트 enable). 저장 바이트마다 쓰기 데이터가 오는 위치가 하나로 정해진다. 읽기는 word를 고른 뒤 그 안에서 1바이트를 고른다. 실제 SRAM을 W바이트 폭 word로 구성하는 것과 같은 모양이다. W는 2의 거듭제곱이고 K_MAX를 나눠야 한다.
+
+**검증**: 회귀를 W = 1, 2, 4, 8, 16 (L = 1)과 stall 조건 2가지 (L = 3, W = 8, 25%와 L = 4, W = 16, 50%)에서 돌려 42회 모두 PASS이고, W = 1 - 16의 명령별 사이클 90개가 수정 전과 모두 같다. 수정 뒤에는 계층 유지 합성도 W = 16이 295,049 um²로 W = 1(295,477)과 같아져, 결과가 합성 방식에 의존하지 않는다.
+
+**결과** (ORFS, 배치 후, 8.1절 환경)
+
+| 구성 | 배치 면적 수정 전 → 후 (um²) | 조합 면적 수정 전 → 후 (um²) | worst slack 수정 전 → 후 (ns) |
+|---|---|---|---|
+| 4×4 W = 1 | 313,392 → 313,192 | 154,748 → 154,436 | 2.00 → 1.81 |
+| 4×4 W = 16 | 502,811 → 316,898 (-37%) | 331,796 → 157,104 (-53%) | 1.89 → 1.70 |
+| 8×8 W = 1 | 821,771 → 817,224 | 469,831 → 465,625 | 1.75 → 1.42 |
+| 8×8 W = 16 | 1,230,561 → 819,707 (-33%) | 840,509 → 466,969 (-44%) | 0.81 → 1.34 |
+
+- W를 넓히는 면적 비용이 거의 없어졌다. 수정 후 W = 16은 W = 1보다 배치 면적이 4×4에서 1.2%, 8×8에서 0.3% 크다.
+- 8×8 W = 16의 최악 경로가 쓰기 경로에서 읽기 주소 경로로 돌아왔고 slack이 0.53 ns 늘었다.
+- W = 1은 수정 전후가 같은 논리인데 slack이 0.19, 0.33 ns 달라졌다. 식의 모양이 조금만 달라도 합성 결과와 배치가 달라지기 때문이다. 그래서 이 흐름에서 약 0.3 ns보다 작은 slack 차이는 구조 차이로 보지 않는다.
+
+---
+
+## 8. 합성과 배치 결과 (Sky130 HD)
+
+### 8.1 환경
+
+| 항목 | 값 |
+|---|---|
+| 흐름 | OpenROAD-flow-scripts, Docker 이미지 `openroad/orfs@sha256:cba40c1de21f048b545c005210dabe728bf501f4bb7d5ae5f03b33feb52b49fa` (2026-10-30 빌드) |
+| 합성 | Yosys 0.68+post (이미지에 포함) |
+| 배치, STA | OpenROAD와 내장 OpenSTA (이미지에 포함, 버전 문자열이 없어 이미지 digest로 고정) |
+| 표준 셀 | Sky130 HD `sky130_fd_sc_hd__tt_025C_1v80` (typical, 25 °C, 1.8 V), LEF `sky130_fd_sc_hd.tlef`, `sky130_fd_sc_hd_merged.lef` |
+| 제약 | 클럭 10 ns (100 MHz), 입출력 지연은 주기의 20% (`syn/constraint.sdc`) |
+| ORFS 단계 | synth (계층 펼침) → floorplan (CORE_UTILIZATION 40, tapcell, PDN) → place (global place, IO 배치, resize, detailed place). 플랫폼 기본값 PLACE_DENSITY 0.60 |
+| 타이밍 기준 | detailed place 후. 배선은 플랫폼 `setRC.tcl`의 층별 RC로 추정 (`estimate_parasitics -placement`), 클럭은 이상적 (CTS 전), 배선(route) 전 |
+| 묶음별 비율 (참고) | 계층을 유지한 Yosys `synth`, `dfflibmap`, `abc -liberty`, `stat -liberty`. PE 배열 = PE 면적 × R×C, bank = `bank_buffer` 인스턴스 합, 제어 = 나머지 |
+| 실행 | `python scripts/run_synth.py` (Windows 11, Docker Desktop 29.0.1, Docker VM CPU 8개, 메모리 약 3.7 GiB) |
+
+### 8.2 결과 (현재 RTL)
+
+| 구성 | ORFS 합성 면적 (um²) | FF | 조합 | 배치 면적 (um², 이용률) | worst slack (ns) | 최악 경로 |
+|---|---|---|---|---|---|---|
+| 4×4 W = 1 | 299,315 | 144,879 | 154,436 | 313,192 (42%) | 1.81 | `j0` → `u_bbuf` `rdata` |
+| 4×4 W = 16 | 301,863 | 144,759 | 157,104 | 316,898 (42%) | 1.70 | `j0` → `u_bbuf` `rdata` |
+| 8×8 W = 1 | 781,508 | 315,883 | 465,625 | 817,224 (42%) | 1.42 | `j0` → `u_bbuf` `rdata` |
+| 8×8 W = 16 | 782,732 | 315,763 | 466,969 | 819,707 (42%) | 1.34 | `t` → `u_bbuf` `rdata` |
+
+묶음별 비율 (계층 합성, 참고): 4×4는 PE 배열 35%, bank 54%, 제어 11%, 8×8은 PE 배열 53%, bank 41%, 제어 6%이다. W에 따라 거의 변하지 않는다.
+
+- 최악 경로는 모두 bank 읽기 경로이다: 타일 위치(`j0`)에서 유효 열 수(`cols_valid`)를 거쳐 `edge_feeder`의 `in_range`, 읽기 주소, 64:1 읽기 mux, `rdata`로 간다.
+- 10 ns에서 slack이 남으면 resizer는 타이밍을 더 개선하지 않는다. 그래서 1000 / (10 - slack)은 도구를 끝까지 밀어붙인 최대 주파수가 아니라 같은 흐름에서의 비교값이다 (4×4 W = 1에서 약 122 MHz).
+
+### 8.3 성능과 면적: 메모리 폭 대 PE 수
+
+(32,64,64), L = 1. 사이클은 RTL 측정 (7.5절), 면적은 8.2절 배치 면적.
+
+| 구성 | 사이클 | MAC/cycle | 배치 면적 (mm²) | MAC/cycle/mm² |
+|---|---|---|---|---|
+| 4×4 W = 1 | 77,057 | 1.70 | 0.313 | 5.4 |
+| 4×4 W = 16 | 15,617 | 8.39 | 0.317 | 26.5 |
+| 8×8 W = 1 | 37,441 | 3.50 | 0.817 | 4.3 |
+| 8×8 W = 16 | 6,721 | 19.50 | 0.820 | 23.8 |
+
+- 4×4에서 W를 1에서 16으로 넓히면 4.93배 빨라지고 면적은 1.01배이다. W = 1에서 PE를 4배(8×8)로 늘리면 2.06배 빨라지고 면적은 2.61배이다.
+- 메모리가 병목인 동안 PE를 늘리면 면적당 처리량이 오히려 준다 (5.4에서 4.3). 메모리 폭을 먼저 넓힌 뒤에는 PE 증가의 효과가 커지지만 (W = 16에서 2.32배), 면적당 처리량은 4×4가 여전히 조금 높다 (26.5 대 23.8). STORE와 P0 재로드가 PE 증가를 따라 줄지 않기 때문이다 (7.5절).
+
+### 8.4 한계
+
+- bank 버퍼는 SRAM macro가 아니라 FF로 구현된다 (6절). 버퍼가 면적의 41 - 54%를 차지하므로, 실제 SRAM을 쓰면 면적 비율과 8.3절의 면적당 처리량이 달라진다.
+- 배치 후, 배선 전, CTS 전 결과이다. 배선 지연, 클럭 skew, hold 수정이 빠져 있다.
+- 전력은 분석하지 않았다.
+- 10 ns 제약 하나에서의 결과이다. 최대 주파수는 더 짧은 주기로 다시 돌려야 정확히 알 수 있다.

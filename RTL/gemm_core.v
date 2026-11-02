@@ -52,6 +52,7 @@ module gemm_core #(
 );
 
     localparam BAW = $clog2(K_MAX);      // bank 칸 주소 폭
+    localparam LW  = $clog2(RD_BYTES);   // bank word 안 바이트 번호 폭 (RD_BYTES는 2의 거듭제곱)
 
     // 상태
     localparam [2:0] ST_IDLE    = 3'd0,  // TB의 명령 기다림
@@ -140,7 +141,7 @@ module gemm_core #(
 
     // 입력 버퍼: A는 행마다 bank 하나, B는 열마다 bank 하나
     // bank 안 주소는 k이다: A bank r의 k번 칸 = A[i0+r][k], B bank c의 k번 칸 = B[k][j0+c]
-    // 응답 beat 하나는 bank 하나의 칸 rsp_k .. rsp_k+rsp_cnt-1에 한 번에 쓴다
+    // 응답 beat 하나는 bank 하나의 word rsp_k / RD_BYTES에 한 번에 쓴다 (rsp_k는 항상 RD_BYTES의 배수)
     localparam [ROWS-1:0] ONE_A = 1;
     localparam [COLS-1:0] ONE_B = 1;
 
@@ -148,6 +149,7 @@ module gemm_core #(
     wire [COLS-1:0] b_wr_en = (rsp_fire &&  rsp_phase_b) ? (ONE_B << rsp_lane) : {COLS{1'b0}};
 
     // beat의 앞쪽 rsp_cnt바이트만 쓴다 (행(열)의 마지막 beat는 K의 나머지만큼)
+    wire [BAW-LW-1:0]   rsp_word = rsp_k[BAW-1:LW];
     wire [RD_BYTES-1:0] rsp_mask;
     genvar mj;
     generate
@@ -165,7 +167,7 @@ module gemm_core #(
     u_abuf (
         .clk(clk),
         .wr_en(a_wr_en), 
-        .wr_addr(rsp_k[BAW-1:0]), 
+        .wr_word(rsp_word), 
         .wr_mask(rsp_mask),
         .wr_data(rd_rsp_data),
         .rd_addr(a_rd_addr), 
@@ -176,7 +178,7 @@ module gemm_core #(
     u_bbuf (
         .clk(clk),
         .wr_en(b_wr_en), 
-        .wr_addr(rsp_k[BAW-1:0]), 
+        .wr_word(rsp_word), 
         .wr_mask(rsp_mask),
         .wr_data(rd_rsp_data),
         .rd_addr(b_rd_addr), 
