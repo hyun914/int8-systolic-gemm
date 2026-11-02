@@ -1,16 +1,15 @@
 `timescale 1ns/1ps
 
-// load_seq : 타일 하나를 메모리에서 읽어 오는 순서를 만든다.
+// load_seq : LOAD 동안 "지금 차례인 원소"를 세는 카운터
 //
-//   A 단계: r = 0 .. rows_valid-1, k = 0 .. K-1   (A[i0+r][k])
-//   B 단계: k = 0 .. K-1, c = 0 .. cols_valid-1   (B[k][j0+c])
-//
-// 출력은 "지금 차례인 원소"의 위치(phase_b, lane, k)와 메모리 주소(addr)이다.
+// 출력 하나로 두 가지를 알려 준다: 메모리에서 어디를 읽을지(addr), bank의 어디에 넣을지(phase_b, lane, k).
+//   A 단계: r = 0 .. rows_valid-1, k = 0 .. K-1   (A[i0+r][k], 주소가 계속 +1)
+//   B 단계: k = 0 .. K-1, c = 0 .. cols_valid-1   (B[k][j0+c], 행 안에서 +1, 다음 행으로 +N)
 // step이 1인 사이클이 끝나면 다음 원소로 넘어가고, 마지막 원소를 지나면 finished가 1이 된다.
 //
-// 코어는 이 모듈을 두 개 쓴다. 하나는 읽기 요청을 보낼 때, 하나는 응답을 받을 때 한 칸씩 진행한다.
-// 메모리가 요청 순서대로 응답한다고 가정하므로 두 순서가 1:1로 맞고,
-// 응답 쪽 출력으로 돌아온 바이트를 넣을 bank와 칸을 알 수 있다.
+// 코어는 이 모듈을 두 개 쓴다. 요청 쪽은 요청이 받아들여질 때, 응답 쪽은 응답이 올 때 한 칸씩 진행한다.
+// 메모리가 요청 순서대로 응답한다고 가정하므로 두 순서가 1:1로 맞고, 응답 쪽 출력이 돌아온 바이트의 bank와 칸을 알려 준다.
+// 그래서 메모리 지연이 몇 사이클이든 요청 정보를 따로 담아 둘 FIFO가 필요 없다.
 module load_seq #(
     parameter AW = 16
 )(
@@ -25,8 +24,8 @@ module load_seq #(
     input  wire [AW-1:0] a_start,     // A[i0][0]의 주소
     input  wire [AW-1:0] b_start,     // B[0][j0]의 주소
     output reg           phase_b,     // 0: A 단계, 1: B 단계
-    output reg  [15:0]   lane,        // A 단계면 r, B 단계면 c
-    output reg  [15:0]   k,
+    output reg  [15:0]   lane,        // bank 번호 (A 단계 r, B 단계 c). 필요한 폭은 log2(max(ROWS, COLS))비트 (README 7.1절)
+    output reg  [15:0]   k,           // bank 안 칸 번호 0 .. K-1. 필요한 폭은 log2(K_MAX)비트 (README 7.1절)
     output reg  [AW-1:0] addr,
     output reg           finished
 );
