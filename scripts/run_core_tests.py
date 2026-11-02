@@ -1,12 +1,13 @@
 """
-S2: GEMM 코어 시스템 검증을 여러 배열 구성에서 실행한다.
+GEMM 코어 시스템 검증을 여러 배열 구성에서 실행한다.
 
 시뮬레이션 한 번에 워크로드 세 개를 연속 명령으로 실행하고,
-끝난 뒤 메모리 전체를 기대값과 비교한다. seed가 짝수면 명령 순서를 뒤집는다.
+끝난 뒤 메모리 전체를 기대값과 비교한다 (판정은 TB). seed가 짝수면 명령 순서를 뒤집는다.
+명령마다 측정 사이클이 사이클 모델(model/perf_model.py) + stall 사이클과 정확히 같은지도 확인한다.
 
 저장소 최상위 폴더에서 실행:
-  python scripts/run_core_tests.py                     # 메모리 읽기 지연 L = 1, beat 폭 W = 1바이트
-  python scripts/run_core_tests.py --lat 3 --width 8   # L = 3, W = 8
+  python scripts/run_core_tests.py                                # L = 1, W = 1바이트, stall 없음
+  python scripts/run_core_tests.py --lat 3 --width 8 --stall 25   # L = 3, W = 8, ready = 0 확률 25%
 """
 
 import argparse
@@ -20,6 +21,7 @@ BUILD = ROOT / "build"
 sys.path.insert(0, str(ROOT / "model"))
 
 from gen_vectors import make_matrices  # noqa: E402
+from perf_model import predict_cycles  # noqa: E402
 
 SHAPES = [(4, 4), (2, 3), (8, 8)]                     # (ROWS, COLS)
 WORKLOADS = [(32, 64, 64), (1, 64, 64), (7, 13, 29)]  # (M, N, K)
@@ -101,21 +103,22 @@ def write_cmds(path, cmds):
                 f.write(f"{value:04x}\n")
 
 
-def compile_tb(rows, cols, lat, width):
-    """ROWS, COLS, 메모리 읽기 지연과 beat 폭을 지정해 TB를 컴파일하고 (성공 여부, 컴파일러 출력)을 돌려준다."""
+def compile_tb(rows, cols, lat, width, stall):
+    """ROWS, COLS와 메모리 조건을 지정해 TB를 컴파일하고 (성공 여부, 컴파일러 출력)을 돌려준다."""
     cmd = ["iverilog", "-g2005",
            f"-Ptb_gemm_core.ROWS={rows}",
            f"-Ptb_gemm_core.COLS={cols}",
            f"-Ptb_gemm_core.RD_LAT={lat}",
            f"-Ptb_gemm_core.RD_BYTES={width}",
+           f"-Ptb_gemm_core.STALL_PCT={stall}",
            "-o", str(SIM)] + SOURCES
     result = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     return result.returncode == 0, result.stdout + result.stderr
 
 
-def run_sim():
-    """시뮬레이션을 실행하고 (통과 여부, 출력)을 돌려준다."""
-    result = subprocess.run(["vvp", "-n", str(SIM)], cwd=ROOT,
+def run_sim(seed):
+    """시뮬레이션을 실행하고 (통과 여부, 출력)을 돌려준다. seed는 stall 패턴을 정한다."""
+    result = subprocess.run(["vvp", "-n", str(SIM), f"+stall_seed={seed}"], cwd=ROOT,
                             capture_output=True, text=True)
     output = result.stdout + result.stderr
     passed = "PASS:" in output and "FATAL" not in output and "FAIL" not in output
@@ -128,7 +131,11 @@ def main():
                         help="TB 메모리 읽기 지연 L (사이클, 1 이상)")
     parser.add_argument("--width", type=int, default=1,
                         help="TB 메모리 읽기 beat 하나의 바이트 수 W (1 이상)")
+    parser.add_argument("--stall", type=int, default=0,
+                        help="사이클마다 메모리 ready를 0으로 내릴 확률 (%%, 0 .. 99)")
     args = parser.parse_args()
+    if not 0 <= args.stall <= 99:
+        parser.error("--stall은 0 이상 99 이하여야 한다")
     if args.lat < 1:
         parser.error("--lat은 1 이상이어야 한다")
     if args.width < 1:
@@ -137,10 +144,10 @@ def main():
     BUILD.mkdir(exist_ok=True)
     failures = []
     total = 0
-    print(f"메모리 읽기 지연 L = {args.lat}, beat 폭 W = {args.width}바이트")
+    print(f"메모리 읽기 지연 L = {args.lat}, beat 폭 W = {args.width}바이트, ready = 0 확률 {args.stall}%")
 
     for rows, cols in SHAPES:
-        compiled, compile_output = compile_tb(rows, cols, args.lat, args.width)
+        compiled, compile_output = compile_tb(rows, cols, args.lat, args.width, args.stall)
         if not compiled:
             total += len(SEEDS)
             label = f"{rows}x{cols} compile"
@@ -155,13 +162,28 @@ def main():
             write_bytes(BUILD / "mem_expect.hex", expect)
             write_cmds(BUILD / "cmds.hex", cmds)
 
-            passed, output = run_sim()
+            passed, output = run_sim(seed)
             total += 1
+
+            # 사이클 확인: 측정값 = 모델 예측 + stall 때문에 미뤄진 사이클
+            notes = []
+            found = re.findall(r"M=(\d+) N=(\d+) K=(\d+) cycles=(\d+) rd_stall=(\d+) wr_stall=(\d+)", output)
+            if passed and len(found) != len(cmds):
+                passed = False
+                notes.append("명령별 사이클 출력이 명령 수와 다르다")
+            for m, n, k, cyc, rd_st, wr_st in found:
+                m, n, k, cyc, rd_st, wr_st = map(int, (m, n, k, cyc, rd_st, wr_st))
+                model = predict_cycles(m, n, k, rows, cols, args.width, args.lat)
+                ok = cyc == model + rd_st + wr_st
+                notes.append(f"        (M,N,K)=({m},{n},{k})  cycles={cyc}  model={model}"
+                             f"  rd_stall={rd_st}  wr_stall={wr_st}" + ("" if ok else "  MISMATCH"))
+                if not ok:
+                    passed = False
 
             label = f"{rows}x{cols} seed={seed}"
             print(("PASS  " if passed else "FAIL  ") + label)
-            for m, n, k, cyc in re.findall(r"M=(\d+) N=(\d+) K=(\d+) cycles=(\d+)", output):
-                print(f"        (M,N,K)=({m},{n},{k})  cycles={cyc}")
+            for note in notes:
+                print(note)
             if not passed:
                 failures.append((label, output))
 

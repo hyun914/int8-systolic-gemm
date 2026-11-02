@@ -14,6 +14,7 @@ INT8 Output-Stationary systolic array 기반 GEMM 코어를 RTL로 설계하고 
 | ROWS×COLS 배열 (파라미터) | `RTL/systolic_array.v` | `tb/tb_array_2x2.v`: 매 사이클 13 step, `tb/tb_array.v`: 60개 구성 |
 | GEMM 코어: bank 입력 버퍼, skew 공급, 타일 제어, 결과 저장 | `RTL/gemm_core.v`, `bank_buffer.v`, `edge_feeder.v`, `load_seq.v` | `tb/tb_gemm_core.v`: 4×4, 2×3, 8×8에서 명령 3개 연속 실행 |
 | 기능 정답 모델, 테스트 벡터 생성 | `model/gemm_reference.py`, `model/gen_vectors.py` | |
+| 사이클 모델 (3.2절 식) | `model/perf_model.py` | 코어 검증에서 명령마다 측정값과 자동 비교 |
 
 사이클 측정과 분석의 기본 조건은 TB의 이상적 메모리 모델(읽기 1바이트/beat, 응답 지연 1사이클)이다. 메모리 지연을 바꾼 측정은 7.2절, 메모리 폭을 바꾼 측정은 7.5절에 있다.
 
@@ -36,7 +37,8 @@ INT8 Output-Stationary systolic array 기반 GEMM 코어를 RTL로 설계하고 
 │   └── tb_gemm_core.v       # 코어 시스템 TB (메모리 모델, 연속 명령)
 ├── model/                   # Python 모델
 │   ├── gemm_reference.py    # 기능 정답 모델 (계산 결과만, 사이클 예측 없음)
-│   └── gen_vectors.py       # 테스트 벡터 생성 (A, B, 정답 C를 hex로 저장)
+│   ├── gen_vectors.py       # 테스트 벡터 생성 (A, B, 정답 C를 hex로 저장)
+│   └── perf_model.py        # 사이클 모델 (상태별 사이클 식)
 └── scripts/
     ├── run_array_tests.py   # 배열 랜덤 검증 실행 (60개 구성)
     └── run_core_tests.py    # 코어 검증 실행
@@ -72,8 +74,11 @@ python scripts/run_array_tests.py
 # 코어 검증: 배열 3가지 × seed 2개, 시뮬레이션마다 세 워크로드 연속 실행 (약 40초)
 python scripts/run_core_tests.py
 
-# 메모리 읽기 지연 L, 읽기 beat 폭 W(바이트)를 바꿔 코어 검증 (기본 둘 다 1)
-python scripts/run_core_tests.py --lat 3 --width 8
+# 메모리 조건을 바꿔 코어 검증: 읽기 지연 L, 읽기 beat 폭 W(바이트), ready = 0 확률(%)
+python scripts/run_core_tests.py --lat 3 --width 8 --stall 25
+
+# 사이클 모델 예측값 출력
+python model/perf_model.py
 ```
 
 `-g2005`: 배열 내부에서 다차원 wire 배열을 사용하므로 지정한다.
@@ -444,6 +449,8 @@ T_total = 타일 수 × (K + R + C + L + 1) + ceil(K/W) × (M × ceil(N/C) + N �
 - (7,13,29), (1,64,64) 경계 타일에서 padding 위치 PE의 acc = 0
 - STORE 동안 유효한 PE의 acc가 이미 최종값 (COMPUTE가 끝난 뒤 STORE 시작)
 - C의 모든 바이트가 정확히 한 번 쓰이고, C 밖의 메모리는 바뀌지 않음
+- valid/ready 규칙: ready = 0이라 전송이 성립하지 않은 다음 사이클에도 읽기 요청은 valid와 주소, 쓰기는 valid와 주소와 데이터가 그대로 (7.6절)
+- 명령마다 측정 사이클 = 사이클 모델(`model/perf_model.py`) 예측 + ready = 0 때문에 미뤄진 사이클. 스크립트가 확인하고, 다르면 FAIL로 판정한다
 
 **RTL 측정 사이클** (이상적 메모리: 읽기 1바이트/사이클, 응답 지연 1, 쓰기 INT32 1개/사이클)
 
@@ -637,3 +644,41 @@ skew(행 r을 r사이클 늦게 배열에 넣는 것)를 만드는 방법은 두
 - LOAD는 배열을 키워도 약 2배만 준다. P0에서 A는 열 방향 타일 수만큼, B는 행 방향 타일 수만큼 다시 읽는데, 8×8에서는 각각 절반이 되기 때문이다.
 - COMPUTE도 4배가 아니라 3.59배만 준다. 타일마다 skew를 채우고 비우는 R + C - 1사이클이 배열과 함께 커진다 (4×4는 7, 8×8은 15).
 - (1,64,64)는 M = 1이라 배열의 한 행만 일한다. 8×8로 키우면 타일 수만 절반이 되어 W = 16에서도 1.56배에 그친다.
+
+### 7.6 메모리 stall (ready = 0)
+
+**배경**: 실제 버스와 메모리는 바쁘면 ready = 0으로 전송을 미룬다. 이전 TB는 ready가 항상 1이라, 코어가 ready를 무시해도 결과가 맞게 나왔다.
+
+**코어의 규칙**
+
+- 전송은 valid && ready인 사이클에만 성립한다. 읽기 요청 쪽 `load_seq`는 `req_fire = rd_req_valid && rd_req_ready`일 때만, STORE는 `wr_valid && wr_ready`일 때만 다음으로 넘어간다.
+- valid는 ready를 보지 않고 정한다 (`rd_req_valid = (state == ST_LOAD) && !req_finished`, `wr_valid = (state == ST_STORE)`). ready를 기다리며 valid를 내리지 않는다.
+- 전송이 성립하지 않으면 주소와 데이터는 다음 사이클에도 그대로다 (카운터가 진행하지 않으므로).
+- 읽기 응답 쪽에는 ready가 없다. 코어는 응답을 항상 받는다 (7.2절 가정).
+
+**검증 방법**
+
+- TB가 읽기 요청 ready와 쓰기 ready를 사이클마다 정해진 확률로 0으로 내린다 (`--stall P`, seed를 고정해 재현 가능).
+- TB가 매 사이클 valid/ready 규칙을 확인한다: 전송이 성립하지 않은 다음 사이클에 valid가 내려가거나 주소, 데이터가 바뀌면 FAIL.
+- 스크립트가 명령마다 `측정 사이클 = 모델 예측 + 읽기 stall 사이클 + 쓰기 stall 사이클`을 확인한다. stall 한 사이클은 전송 하나를 정확히 한 사이클 미룬다. 읽기 요청이 밀리면 마지막 응답과 LOAD 끝이 같이 밀리고, 쓰기가 밀리면 STORE가 그만큼 길어지기 때문이다.
+
+**결과**: 아래 6가지 조건 × 배열 3가지 × seed 2개 = 36회, 명령 108개가 모두 PASS이고, 108개 모두 사이클 식이 정확히 맞았다.
+
+| L | W | ready = 0 확률 |
+|---|---|---|
+| 1 | 1 | 10%, 25% |
+| 1 | 4 | 25% |
+| 3 | 8 | 25% |
+| 4 | 16 | 50% |
+| 16 | 2 | 50% |
+
+예: 4×4, (32,64,64), L = 1, W = 1, 25%에서 측정 99,591 = 모델 77,057 + 읽기 stall 21,864 + 쓰기 stall 670.
+
+**고장 주입**: 코어가 ready를 무시하게 고친 변형으로 검사가 실제로 잡는지 확인했다 (4×4, 변형은 저장소에 포함하지 않음).
+
+| 넣은 버그 | stall 없음 | ready = 0 확률 25% |
+|---|---|---|
+| 읽기 요청 쪽 `load_seq`가 valid만 보고 진행 | PASS (못 잡음) | FAIL: 첫 stall에서 요청 주소가 바뀜 |
+| STORE가 valid만 보고 다음 원소로 진행 | PASS (못 잡음) | FAIL: 첫 stall에서 쓰기 주소가 바뀜 |
+
+ready가 항상 1인 TB로는 두 버그 모두 드러나지 않는다. ready를 무시하는 버그는 stall을 넣어야만 검증할 수 있다.

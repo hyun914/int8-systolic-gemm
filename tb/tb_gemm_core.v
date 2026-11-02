@@ -12,15 +12,20 @@
 //   - C의 모든 바이트가 정확히 한 번씩 쓰였다
 //   - STORE 동안 유효한 PE의 acc는 이미 최종 정답이다 (COMPUTE가 끝난 뒤에 STORE를 시작했다)
 //   - STORE 동안 유효 범위 밖 PE의 acc는 0이다 (padding을 배열에 넣지 않았다)
+//   - valid/ready 규칙: ready = 0이라 전송이 성립하지 않은 다음 사이클에도 valid와 주소(쓰기는 데이터까지)가 그대로다
 //
-// 메모리 모델: 항상 ready, 읽기 응답은 요청이 성립하고 RD_LAT사이클 뒤에 돌아온다 (기본 1).
+// 메모리 모델: 읽기 응답은 요청이 성립하고 RD_LAT사이클 뒤에 돌아온다 (기본 1).
 //   요청 하나에 요청 주소부터 연속 RD_BYTES바이트를 돌려준다 (기본 1). 주소 정렬 제약은 두지 않는다.
+//   읽기 요청과 쓰기의 ready는 사이클마다 STALL_PCT% 확률로 0이 된다 (기본 0: 항상 ready).
+//   난수 seed는 +stall_seed=N으로 정하므로 같은 seed면 같은 stall 패턴이 나온다.
+//   명령마다 ready = 0 때문에 전송이 미뤄진 사이클 수(rd_stall, wr_stall)를 출력한다.
 module tb_gemm_core;
 
     parameter     ROWS = 4;
     parameter     COLS = 4;
     parameter     RD_LAT = 1;   // 메모리 읽기 지연 L (사이클, 1 이상)
     parameter     RD_BYTES = 1; // 메모리 읽기 beat 하나의 바이트 수 W
+    parameter     STALL_PCT = 0; // 사이클마다 ready를 0으로 내릴 확률 (%, 0 .. 100)
 
     localparam    K_MAX     = 64;
     localparam    AW        = 16;
@@ -57,6 +62,13 @@ module tb_gemm_core;
     integer exp_addr;
     reg [31:0] exp_word;
     integer cycles;
+    integer rd_stall_total, wr_stall_total;   // ready = 0 때문에 전송이 미뤄진 사이클 수 (누적)
+    integer rd_stall0, wr_stall0;             // 명령 시작 때의 누적값
+
+    // 메모리 ready: 정해진 seed의 난수로 사이클마다 정한다
+    reg     rd_req_ready;
+    reg     wr_ready;
+    integer rnd_rd, rnd_wr;
 
     gemm_core #(
         .ROWS(ROWS), .COLS(COLS), .K_MAX(K_MAX), .AW(AW), .RD_BYTES(RD_BYTES)
@@ -66,16 +78,60 @@ module tb_gemm_core;
         .m_len(cmd_m), .n_len(cmd_n), .k_len(cmd_k),
         .base_a(cmd_base_a), .base_b(cmd_base_b), .base_c(cmd_base_c),
         .busy(busy), .done(done),
-        .rd_req_valid(rd_req_valid), .rd_req_ready(1'b1), .rd_req_addr(rd_req_addr),
+        .rd_req_valid(rd_req_valid), .rd_req_ready(rd_req_ready), .rd_req_addr(rd_req_addr),
         .rd_rsp_valid(rd_rsp_valid), .rd_rsp_data(rd_rsp_data),
-        .wr_valid(wr_valid), .wr_ready(1'b1), .wr_addr(wr_addr), .wr_data(wr_data)
+        .wr_valid(wr_valid), .wr_ready(wr_ready), .wr_addr(wr_addr), .wr_data(wr_data)
     );
 
     // 100MHz 클럭
     initial clk = 1'b0;
     always #5 clk = ~clk;
 
-    // 메모리 읽기: ready가 항상 1이므로 valid인 사이클마다 요청이 성립하고, RD_LAT사이클 뒤에 응답한다.
+    initial begin
+        if (!$value$plusargs("stall_seed=%d", rnd_rd))
+            rnd_rd = 1;
+        rnd_wr = rnd_rd + 7919;                         // 읽기와 쓰기는 서로 다른 난수열
+    end
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            rd_req_ready <= 1'b1;
+            wr_ready     <= 1'b1;
+        end else begin
+            rd_req_ready <= ({$random(rnd_rd)} % 100) >= STALL_PCT;
+            wr_ready     <= ({$random(rnd_wr)} % 100) >= STALL_PCT;
+        end
+    end
+
+    // valid/ready 규칙 확인: 전송이 성립하지 않은 사이클 다음에도 valid, 주소, 데이터가 그대로여야 한다
+    reg           rd_hold, wr_hold;
+    reg [AW-1:0]  rd_addr_q, wr_addr_q;
+    reg [31:0]    wr_data_q;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            rd_hold        <= 1'b0;
+            wr_hold        <= 1'b0;
+            rd_stall_total <= 0;
+            wr_stall_total <= 0;
+        end else begin
+            if (rd_hold && (!rd_req_valid || rd_req_addr !== rd_addr_q))
+                $fatal(1, "FAIL protocol: read request changed while stalled (valid=%b addr=%0d, was %0d)",
+                       rd_req_valid, rd_req_addr, rd_addr_q);
+            if (wr_hold && (!wr_valid || wr_addr !== wr_addr_q || wr_data !== wr_data_q))
+                $fatal(1, "FAIL protocol: write changed while stalled (valid=%b addr=%0d, was %0d)",
+                       wr_valid, wr_addr, wr_addr_q);
+            rd_hold   <= rd_req_valid && !rd_req_ready;
+            wr_hold   <= wr_valid && !wr_ready;
+            rd_addr_q <= rd_req_addr;
+            wr_addr_q <= wr_addr;
+            wr_data_q <= wr_data;
+            if (rd_req_valid && !rd_req_ready) rd_stall_total <= rd_stall_total + 1;
+            if (wr_valid && !wr_ready)         wr_stall_total <= wr_stall_total + 1;
+        end
+    end
+
+    // 메모리 읽기: valid && ready인 사이클에 요청이 성립하고, RD_LAT사이클 뒤에 응답한다.
     // valid와 data를 RD_LAT칸짜리 shift register로 나란히 민다 (칸 하나 = FF 하나 = 1사이클).
     // RD_LAT = 1이면 요청 다음 사이클에 응답한다 (S2 기본값).
     reg        rsp_v_pipe [0:RD_LAT-1];
@@ -87,7 +143,7 @@ module tb_gemm_core;
             for (li = 0; li < RD_LAT; li = li + 1)
                 rsp_v_pipe[li] <= 1'b0;
         end else begin
-            rsp_v_pipe[0] <= rd_req_valid;              // 1칸째: 요청이 성립한 사이클의 값을 담는다
+            rsp_v_pipe[0] <= rd_req_valid && rd_req_ready; // 1칸째: 요청이 성립한 사이클의 값을 담는다
             for (bj = 0; bj < RD_BYTES; bj = bj + 1)     // 요청 주소부터 연속 RD_BYTES바이트
                 rsp_d_pipe[0][bj*8 +: 8] <= mem[rd_req_addr + bj];
             for (li = 1; li < RD_LAT; li = li + 1) begin
@@ -100,9 +156,9 @@ module tb_gemm_core;
     assign rd_rsp_valid = rsp_v_pipe[RD_LAT-1];         // 마지막 칸이 코어로 나간다
     assign rd_rsp_data  = rsp_d_pipe[RD_LAT-1];
 
-    // 메모리 쓰기: C 원소 하나(4바이트)를 little-endian으로 저장한다.
+    // 메모리 쓰기: valid && ready인 사이클에 C 원소 하나(4바이트)를 little-endian으로 저장한다.
     always @(posedge clk) begin
-        if (rst_n && wr_valid) begin
+        if (rst_n && wr_valid && wr_ready) begin
             if (wr_addr[1:0] != 2'b00)
                 $fatal(1, "FAIL write: unaligned address %0d", wr_addr);
             for (wi = 0; wi < 4; wi = wi + 1) begin
@@ -171,6 +227,8 @@ module tb_gemm_core;
             cmd_base_c = cmds[6 + 6*ci];
             if (cmd_k < 1 || cmd_k > K_MAX)
                 $fatal(1, "FAIL cmd %0d: K=%0d is outside 1..%0d", ci, cmd_k, K_MAX);
+            rd_stall0 = rd_stall_total;
+            wr_stall0 = wr_stall_total;
             start = 1'b1;
             @(negedge clk);
             start = 1'b0;
@@ -181,7 +239,8 @@ module tb_gemm_core;
                 @(negedge clk);
                 cycles = cycles + 1;
             end
-            $display("CMD %0d: M=%0d N=%0d K=%0d cycles=%0d", ci, cmd_m, cmd_n, cmd_k, cycles);
+            $display("CMD %0d: M=%0d N=%0d K=%0d cycles=%0d rd_stall=%0d wr_stall=%0d", ci, cmd_m, cmd_n, cmd_k,
+                     cycles, rd_stall_total - rd_stall0, wr_stall_total - wr_stall0);
         end
 
         // 모든 C 바이트가 쓰였는지
