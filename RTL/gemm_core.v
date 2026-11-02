@@ -11,15 +11,17 @@
 //   B[k][j] = base_b + j*K + k          INT8, 전치 배치 (N x K): 열마다 k가 이어진다
 //   C[i][j] = base_c + (i*N + j)*4      INT32, little-endian
 //
-// 메모리 인터페이스 (S2: 읽기는 1바이트/beat, 쓰기는 INT32 1개/beat)
-//   읽기 요청 : rd_req_valid, rd_req_ready, rd_req_addr
-//   읽기 응답 : rd_rsp_valid, rd_rsp_data  (요청 순서대로 돌아오고, 코어는 항상 받는다)
+// 메모리 인터페이스 (읽기는 RD_BYTES바이트/beat, 쓰기는 INT32 1개/beat)
+//   읽기 요청 : rd_req_valid, rd_req_ready, rd_req_addr  (rd_req_addr부터 연속 RD_BYTES바이트)
+//   읽기 응답 : rd_rsp_valid, rd_rsp_data  (요청 순서대로 돌아오고, 코어는 항상 받는다.
+//               rd_rsp_data[j*8 +: 8] = 주소 rd_req_addr+j의 바이트. 행(열)의 마지막 beat는 앞쪽 일부만 쓴다)
 //   쓰기      : wr_valid, wr_ready, wr_addr, wr_data
 module gemm_core #(
     parameter ROWS  = 4,
     parameter COLS  = 4,
     parameter K_MAX = 64,                // 버퍼에 담을 수 있는 최대 K
-    parameter AW    = 16                 // 메모리 바이트 주소 폭
+    parameter AW    = 16,                // 메모리 바이트 주소 폭
+    parameter RD_BYTES = 1               // 메모리 읽기 beat 하나의 바이트 수 W
 )(
     input  wire          clk,
     input  wire          rst_n,
@@ -40,7 +42,7 @@ module gemm_core #(
     input  wire          rd_req_ready,
     output wire [AW-1:0] rd_req_addr,
     input  wire          rd_rsp_valid,
-    input  wire [7:0]    rd_rsp_data,
+    input  wire [RD_BYTES*8-1:0] rd_rsp_data,
 
     // 메모리 쓰기
     output wire          wr_valid,
@@ -88,7 +90,7 @@ module gemm_core #(
     wire [AW-1:0] req_addr;
     wire          req_finished;
 
-    load_seq #(.AW(AW)) 
+    load_seq #(.AW(AW), .W(RD_BYTES)) 
     u_req_seq (
         .clk(clk), 
         .rst_n(rst_n),
@@ -102,6 +104,7 @@ module gemm_core #(
         .phase_b(), 
         .lane(), 
         .k(),
+        .cnt(),
         .addr(req_addr), 
         .finished(req_finished)
     );
@@ -113,9 +116,10 @@ module gemm_core #(
     wire        rsp_phase_b;
     wire [15:0] rsp_lane;
     wire [15:0] rsp_k;
+    wire [15:0] rsp_cnt;                     // 이번 응답 beat에서 쓸모 있는 바이트 수
     wire        rsp_finished;
 
-    load_seq #(.AW(AW)) 
+    load_seq #(.AW(AW), .W(RD_BYTES)) 
     u_rsp_seq (
         .clk(clk), 
         .rst_n(rst_n),
@@ -129,38 +133,51 @@ module gemm_core #(
         .phase_b(rsp_phase_b), 
         .lane(rsp_lane), 
         .k(rsp_k),
+        .cnt(rsp_cnt),
         .addr(), 
         .finished(rsp_finished)
     );
 
     // 입력 버퍼: A는 행마다 bank 하나, B는 열마다 bank 하나
     // bank 안 주소는 k이다: A bank r의 k번 칸 = A[i0+r][k], B bank c의 k번 칸 = B[k][j0+c]
+    // 응답 beat 하나는 bank 하나의 칸 rsp_k .. rsp_k+rsp_cnt-1에 한 번에 쓴다
     localparam [ROWS-1:0] ONE_A = 1;
     localparam [COLS-1:0] ONE_B = 1;
 
     wire [ROWS-1:0] a_wr_en = (rsp_fire && !rsp_phase_b) ? (ONE_A << rsp_lane) : {ROWS{1'b0}};
     wire [COLS-1:0] b_wr_en = (rsp_fire &&  rsp_phase_b) ? (ONE_B << rsp_lane) : {COLS{1'b0}};
 
+    // beat의 앞쪽 rsp_cnt바이트만 쓴다 (행(열)의 마지막 beat는 K의 나머지만큼)
+    wire [RD_BYTES-1:0] rsp_mask;
+    genvar mj;
+    generate
+        for (mj = 0; mj < RD_BYTES; mj = mj + 1) begin : g_mask
+            assign rsp_mask[mj] = (mj < rsp_cnt);
+        end
+    endgenerate
+
     wire [ROWS*BAW-1:0] a_rd_addr;
     wire [ROWS*8-1:0]   a_rd_data;
     wire [COLS*BAW-1:0] b_rd_addr;
     wire [COLS*8-1:0]   b_rd_data;
 
-    bank_buffer #(.NBANK(ROWS), .DEPTH(K_MAX), .AW(BAW)) 
+    bank_buffer #(.NBANK(ROWS), .DEPTH(K_MAX), .AW(BAW), .WB(RD_BYTES)) 
     u_abuf (
         .clk(clk),
         .wr_en(a_wr_en), 
         .wr_addr(rsp_k[BAW-1:0]), 
+        .wr_mask(rsp_mask),
         .wr_data(rd_rsp_data),
         .rd_addr(a_rd_addr), 
         .rd_data(a_rd_data)
     );
 
-    bank_buffer #(.NBANK(COLS), .DEPTH(K_MAX), .AW(BAW)) 
+    bank_buffer #(.NBANK(COLS), .DEPTH(K_MAX), .AW(BAW), .WB(RD_BYTES)) 
     u_bbuf (
         .clk(clk),
         .wr_en(b_wr_en), 
         .wr_addr(rsp_k[BAW-1:0]), 
+        .wr_mask(rsp_mask),
         .wr_data(rd_rsp_data),
         .rd_addr(b_rd_addr), 
         .rd_data(b_rd_data)

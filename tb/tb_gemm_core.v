@@ -14,11 +14,13 @@
 //   - STORE 동안 유효 범위 밖 PE의 acc는 0이다 (padding을 배열에 넣지 않았다)
 //
 // 메모리 모델: 항상 ready, 읽기 응답은 요청이 성립하고 RD_LAT사이클 뒤에 돌아온다 (기본 1).
+//   요청 하나에 요청 주소부터 연속 RD_BYTES바이트를 돌려준다 (기본 1). 주소 정렬 제약은 두지 않는다.
 module tb_gemm_core;
 
     parameter     ROWS = 4;
     parameter     COLS = 4;
     parameter     RD_LAT = 1;   // 메모리 읽기 지연 L (사이클, 1 이상)
+    parameter     RD_BYTES = 1; // 메모리 읽기 beat 하나의 바이트 수 W
 
     localparam    K_MAX     = 64;
     localparam    AW        = 16;
@@ -37,7 +39,7 @@ module tb_gemm_core;
     wire          rd_req_valid;
     wire [AW-1:0] rd_req_addr;
     wire          rd_rsp_valid;
-    wire [7:0]    rd_rsp_data;
+    wire [RD_BYTES*8-1:0] rd_rsp_data;
 
     wire          wr_valid;
     wire [AW-1:0] wr_addr;
@@ -57,7 +59,7 @@ module tb_gemm_core;
     integer cycles;
 
     gemm_core #(
-        .ROWS(ROWS), .COLS(COLS), .K_MAX(K_MAX), .AW(AW)
+        .ROWS(ROWS), .COLS(COLS), .K_MAX(K_MAX), .AW(AW), .RD_BYTES(RD_BYTES)
     ) dut (
         .clk(clk), .rst_n(rst_n),
         .start(start),
@@ -77,8 +79,8 @@ module tb_gemm_core;
     // valid와 data를 RD_LAT칸짜리 shift register로 나란히 민다 (칸 하나 = FF 하나 = 1사이클).
     // RD_LAT = 1이면 요청 다음 사이클에 응답한다 (S2 기본값).
     reg        rsp_v_pipe [0:RD_LAT-1];
-    reg [7:0]  rsp_d_pipe [0:RD_LAT-1];
-    integer    li;
+    reg [RD_BYTES*8-1:0] rsp_d_pipe [0:RD_LAT-1];
+    integer    li, bj;
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -86,7 +88,8 @@ module tb_gemm_core;
                 rsp_v_pipe[li] <= 1'b0;
         end else begin
             rsp_v_pipe[0] <= rd_req_valid;              // 1칸째: 요청이 성립한 사이클의 값을 담는다
-            rsp_d_pipe[0] <= mem[rd_req_addr];
+            for (bj = 0; bj < RD_BYTES; bj = bj + 1)     // 요청 주소부터 연속 RD_BYTES바이트
+                rsp_d_pipe[0][bj*8 +: 8] <= mem[rd_req_addr + bj];
             for (li = 1; li < RD_LAT; li = li + 1) begin
                 rsp_v_pipe[li] <= rsp_v_pipe[li-1];     // 한 사이클에 한 칸씩 이동
                 rsp_d_pipe[li] <= rsp_d_pipe[li-1];

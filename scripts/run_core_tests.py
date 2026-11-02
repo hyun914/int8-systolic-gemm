@@ -5,8 +5,8 @@ S2: GEMM 코어 시스템 검증을 여러 배열 구성에서 실행한다.
 끝난 뒤 메모리 전체를 기대값과 비교한다. seed가 짝수면 명령 순서를 뒤집는다.
 
 저장소 최상위 폴더에서 실행:
-  python scripts/run_core_tests.py            # 메모리 읽기 지연 L = 1
-  python scripts/run_core_tests.py --lat 3    # L = 3
+  python scripts/run_core_tests.py                     # 메모리 읽기 지연 L = 1, beat 폭 W = 1바이트
+  python scripts/run_core_tests.py --lat 3 --width 8   # L = 3, W = 8
 """
 
 import argparse
@@ -101,12 +101,13 @@ def write_cmds(path, cmds):
                 f.write(f"{value:04x}\n")
 
 
-def compile_tb(rows, cols, lat):
-    """ROWS, COLS, 메모리 읽기 지연을 지정해 TB를 컴파일하고 (성공 여부, 컴파일러 출력)을 돌려준다."""
+def compile_tb(rows, cols, lat, width):
+    """ROWS, COLS, 메모리 읽기 지연과 beat 폭을 지정해 TB를 컴파일하고 (성공 여부, 컴파일러 출력)을 돌려준다."""
     cmd = ["iverilog", "-g2005",
            f"-Ptb_gemm_core.ROWS={rows}",
            f"-Ptb_gemm_core.COLS={cols}",
            f"-Ptb_gemm_core.RD_LAT={lat}",
+           f"-Ptb_gemm_core.RD_BYTES={width}",
            "-o", str(SIM)] + SOURCES
     result = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     return result.returncode == 0, result.stdout + result.stderr
@@ -125,17 +126,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--lat", type=int, default=1,
                         help="TB 메모리 읽기 지연 L (사이클, 1 이상)")
+    parser.add_argument("--width", type=int, default=1,
+                        help="TB 메모리 읽기 beat 하나의 바이트 수 W (1 이상)")
     args = parser.parse_args()
     if args.lat < 1:
         parser.error("--lat은 1 이상이어야 한다")
+    if args.width < 1:
+        parser.error("--width는 1 이상이어야 한다")
 
     BUILD.mkdir(exist_ok=True)
     failures = []
     total = 0
-    print(f"메모리 읽기 지연 L = {args.lat}")
+    print(f"메모리 읽기 지연 L = {args.lat}, beat 폭 W = {args.width}바이트")
 
     for rows, cols in SHAPES:
-        compiled, compile_output = compile_tb(rows, cols, args.lat)
+        compiled, compile_output = compile_tb(rows, cols, args.lat, args.width)
         if not compiled:
             total += len(SEEDS)
             label = f"{rows}x{cols} compile"
