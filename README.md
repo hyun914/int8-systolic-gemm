@@ -489,7 +489,7 @@ T_total = 타일 수 × (K + R + C + L + 1) + ceil(K/W) × (M × ceil(N/C) + N �
 - Python 모델 예측값과 RTL 측정값을 구분해서 표기한다.
 - 각 실험에서 고정한 자원과 변경한 자원을 함께 기록한다.
 - 파라미터화는 구성별 검증을 대신하지 않는다. RTL 검증 구성은 해당 구성에서 계산 결과, skew, 완료 사이클, 초기화, 경계 처리를 확인한 것만 포함한다.
-- 전력 분석, 실제 SRAM macro, 물리 구현을 수행하지 않았으므로 해당 PPA 수치를 주장하지 않는다. behavioral 버퍼를 합성했다면 그 면적은 SRAM macro 기반 면적으로 해석하지 않는다.
+- 전력 분석, 실제 SRAM macro, CTS와 배선을 수행하지 않았으므로 해당 수치를 주장하지 않는다 (면적과 배치 후 타이밍은 8절). bank 버퍼는 FF로 합성했으므로 그 면적을 SRAM macro 기반 면적으로 해석하지 않는다.
 - 외부 인터페이스는 단순 ready/valid이며 AMBA AXI 구현이 아니다.
 - 이 프로젝트는 Output-Stationary systolic GEMM 코어이며 TPU 전체 구조를 재현한 것이 아니다.
 
