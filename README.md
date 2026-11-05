@@ -119,7 +119,7 @@ python scripts/run_synth.py --config 4 4 16    # ROWS COLS RD_BYTES 하나만
 
 ### 제외
 
-Double buffering, K 분할, AXI, 합성 면적, 전력, SRAM macro 수치.
+Double buffering, K 분할, AXI, 전력, SRAM macro 수치.
 
 ---
 
